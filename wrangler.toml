@@ -1,0 +1,22 @@
+name = "arc-payment-control"
+main = "src/index.js"
+compatibility_date = "2026-07-28"
+
+# D1 database for audit records
+[[d1_databases]]
+binding = "DB"
+database_name = "arc-payment-db"
+database_id = "local-dev"
+
+# Environment variables
+[vars]
+ARC_TESTNET_RPC = "https://testnet.arc.network"
+ARC_MAINNET_RPC = "https://mainnet.arc.network"
+OWNER_WALLET = "0xf1437d9cd304ae49f2ec005ac967813b3a7c466c"
+NETWORK = "testnet"
+TIER_FREE_LIMIT = "1000"
+TIER_PRO_MONTHLY = "50"    # $50/month
+TIER_PRO_LIMIT = "50000"
+
+[site]
+bucket = "./public"

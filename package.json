@@ -1,0 +1,17 @@
+{
+  "name": "arc-payment-control",
+  "version": "1.0.0",
+  "description": "Arc Payment Policy Gateway - AI Agent USDC payment control for Arc testnet",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "wrangler build"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
