@@ -202,8 +202,10 @@ app.post('/api/register', async (c) => {
   const { owner, tier } = body
   if (!owner) return c.json({ error: 'owner required (wallet address)' }, 400)
 
-  const { nanoid } = await import('nanoid')
-  const apiKey = `arc_${nanoid(24)}`
+  // Generate random API key using crypto
+  const arr = new Uint8Array(18)
+  crypto.getRandomValues(arr)
+  const apiKey = `arc_${Array.from(arr, b => b.toString(16).padStart(2, '0')).join('')}`
 
   await c.env.DB.prepare(
     'INSERT INTO api_keys (key, tier, owner) VALUES (?, ?, ?)'
