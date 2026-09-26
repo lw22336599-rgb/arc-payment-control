@@ -1,274 +1,456 @@
-import { Hono } from 'hono'
-import { cors } from 'hono/cors'
+import { Hono } from "hono"
+import { cors } from "hono/cors"
+import {
+  MIN_MAX_FEE_PER_GAS,
+  USDC,
+  activeNetwork,
+  dollarsToMicro,
+  encodeErc20Transfer,
+  evaluateEvidence,
+  evaluatePreflight,
+  isAddress,
+  mainnetEnabled,
+  microToDollars,
+  policyLimits,
+  resolveRpc,
+  decodePayment,
+} from "./domain.js"
+import { createSqlRepo } from "./repo.js"
+import { pageHtml } from "./page.js"
 
 const app = new Hono()
-app.use('/*', cors())
+app.use("/*", cors())
 
-// ====== 数据库初始化 ======
-async function initDB(env) {
-  if (!env.DB) return
-  await env.DB.exec(`
-    CREATE TABLE IF NOT EXISTS api_keys (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      key TEXT UNIQUE NOT NULL,
-      tier TEXT DEFAULT 'free',
-      owner TEXT NOT NULL,
-      created_at TEXT DEFAULT (datetime('now')),
-      calls INTEGER DEFAULT 0,
-      last_call TEXT
-    );
-    CREATE TABLE IF NOT EXISTS payment_intents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      api_key TEXT NOT NULL,
-      recipient TEXT NOT NULL,
-      amount TEXT NOT NULL,
-      status TEXT DEFAULT 'pending',
-      tx_hash TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      checked_at TEXT,
-      reconciled_at TEXT,
-      policy_decision TEXT
-    );
-    CREATE TABLE IF NOT EXISTS audit_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      api_key TEXT NOT NULL,
-      action TEXT NOT NULL,
-      detail TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-  `)
+function repoOf(env) {
+  if (env.REPO) return env.REPO
+  if (!env.DB) return null
+  if (!env._repo) env._repo = createSqlRepo(env.DB)
+  return env._repo
 }
 
-// ====== 中间件：API Key验证 ======
-async function requireApiKey(c, next) {
-  // Free tier - anyone can use without key for basic health check
-  const path = c.req.path
-  if (path === '/api/health' || path === '/') return next()
+function nowOf(env) {
+  return env?.NOW ? new Date(env.NOW) : new Date()
+}
 
-  const apiKey = c.req.header('x-api-key')
-  if (!apiKey) return c.json({ error: 'Missing x-api-key header' }, 401)
+function today(env) {
+  return nowOf(env).toISOString().slice(0, 10)
+}
 
-  const row = await c.env.DB.prepare('SELECT * FROM api_keys WHERE key = ?').bind(apiKey).first()
-  if (!row) return c.json({ error: 'Invalid API key' }, 401)
+function monthOf(env) {
+  return today(env).slice(0, 7)
+}
 
-  // Update usage
-  await c.env.DB.prepare(
-    'UPDATE api_keys SET calls = calls + 1, last_call = datetime("now") WHERE key = ?'
-  ).bind(apiKey).run()
+function newId(prefix, bytes) {
+  const arr = new Uint8Array(bytes)
+  crypto.getRandomValues(arr)
+  const hex = Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("")
+  return prefix ? `${prefix}${hex}` : hex
+}
 
-  // Check tier limits
-  const limit = row.tier === 'pro' ? parseInt(c.env.TIER_PRO_LIMIT) : parseInt(c.env.TIER_FREE_LIMIT)
-  if (row.calls >= limit && row.tier === 'free') {
-    return c.json({ 
-      error: 'Free tier limit reached',
-      limit,
-      upgrade: `Pay USDC to ${c.env.OWNER_WALLET} and send tx hash to get Pro tier`
-    }, 402)
+async function readJson(c) {
+  try {
+    return await c.req.json()
+  } catch {
+    return null
   }
+}
 
-  c.set('apiKey', apiKey)
-  c.set('tier', row.tier)
+async function rpc(url, method, params) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  })
+  if (!res.ok) throw new Error(`rpc http ${res.status}`)
+  const data = await res.json()
+  if (data.error) throw new Error(data.error.message || "rpc error")
+  return data.result
+}
+
+function canonicalTransfer(recipient, amountMicro) {
+  return {
+    to: USDC,
+    data: encodeErc20Transfer(recipient, amountMicro),
+    value: "0x0",
+  }
+}
+
+function viewLink(row, origin, env) {
+  const network = activeNetwork(env)
+  return {
+    id: row.id,
+    recipient: row.recipient,
+    amount: row.amount_display,
+    amountMicro: row.amount_micro,
+    purpose: row.purpose,
+    status: row.status,
+    txHash: row.tx_hash || null,
+    payer: row.payer || null,
+    network: network.key,
+    chainId: network.chainId,
+    usdc: USDC,
+    payUrl: `${origin}/pay/${row.id}`,
+    pricing: "free",
+  }
+}
+
+async function chainState(env) {
+  const network = activeNetwork(env)
+  const endpoint = resolveRpc(env)
+  const hex = await rpc(endpoint, "eth_chainId", [])
+  const blockHex = await rpc(endpoint, "eth_blockNumber", [])
+  return {
+    network,
+    endpoint,
+    chainId: Number(BigInt(hex)),
+    blockNumber: Number(BigInt(blockHex)),
+  }
+}
+
+async function simulate(env, tx, from) {
+  try {
+    await rpc(resolveRpc(env), "eth_call", [
+      { from, to: tx.to, data: tx.data, value: tx.value },
+      "latest",
+    ])
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: error.message || "模拟失败" }
+  }
+}
+
+async function runPreflight(env, { recipient, amount, from, apiKey, tx, exceptLinkId }) {
+  const network = activeNetwork(env)
+  const limits = policyLimits(env)
+  let chainId = null
+  try {
+    const state = await chainState(env)
+    chainId = state.chainId
+  } catch (error) {
+    return { decision: "BLOCK", reasons: [`无法读取 Arc 链：${error.message}`], tx: null }
+  }
+  const repo = repoOf(env)
+  const spent = repo && apiKey ? await repo.daySpentMicro(apiKey, today(env), exceptLinkId) : 0n
+  let unsigned = tx || null
+  if (!unsigned && from && recipient && amount != null) {
+    try {
+      unsigned = canonicalTransfer(recipient, dollarsToMicro(amount))
+    } catch (error) {
+      return { decision: "BLOCK", reasons: [error.message], tx: null }
+    }
+  }
+  const simulation = unsigned && from ? await simulate(env, unsigned, from) : null
+  const result = evaluatePreflight({
+    network: network.key,
+    mainnetEnabled: mainnetEnabled(env),
+    chainId,
+    expectedChainId: network.chainId,
+    recipient,
+    amount,
+    tx: unsigned,
+    daySpentMicro: spent,
+    maxSingleMicro: limits.single,
+    maxDailyMicro: limits.daily,
+    simulation,
+    requireSimulation: true,
+  })
+  return { ...result, tx: result.decision === "ALLOW" ? unsigned : null, chainId }
+}
+
+app.get("/api/health", async (c) => {
+  const network = activeNetwork(c.env)
+  try {
+    const state = await chainState(c.env)
+    const enabled = mainnetEnabled(c.env)
+    const ok = state.chainId === network.chainId && (network.key !== "mainnet" || enabled)
+    return c.json(
+      {
+        ok,
+        custody: false,
+        pricing: "free",
+        network: network.key,
+        chainId: state.chainId,
+        expectedChainId: network.chainId,
+        blockNumber: state.blockNumber,
+        usdc: USDC,
+        mainnetEnabled: enabled,
+      },
+      ok ? 200 : 503,
+    )
+  } catch {
+    return c.json(
+      { ok: false, pricing: "free", error: "rpc_unavailable", expectedChainId: network.chainId },
+      503,
+    )
+  }
+})
+
+app.get("/api/config", (c) => {
+  const network = activeNetwork(c.env)
+  const limits = policyLimits(c.env)
+  return c.json({
+    pricing: "free",
+    custody: false,
+    network: network.key,
+    chainId: network.chainId,
+    chainIdHex: network.chainIdHex,
+    rpc: network.rpc,
+    explorer: network.explorer,
+    name: network.name,
+    usdc: USDC,
+    minMaxFeePerGas: "0x" + MIN_MAX_FEE_PER_GAS.toString(16),
+    mainnetEnabled: mainnetEnabled(c.env),
+    maxSingle: microToDollars(limits.single),
+    maxDaily: microToDollars(limits.daily),
+  })
+})
+
+app.get("/", (c) => c.html(pageHtml()))
+app.get("/pay/:id", (c) => c.html(pageHtml()))
+
+app.post("/api/register", async (c) => {
+  const body = await readJson(c)
+  const owner = body?.owner
+  if (!isAddress(owner || "")) return c.json({ error: "owner 必须是钱包地址" }, 400)
+  const repo = repoOf(c.env)
+  if (!repo) return c.json({ error: "数据库未配置" }, 503)
+  const apiKey = newId("arc_", 18)
+  await repo.createKey({ key: apiKey, owner })
+  await repo.audit(apiKey, "register", { owner, pricing: "free" })
+  return c.json({
+    apiKey,
+    tier: "free",
+    pricing: "free",
+    owner,
+    note: "当前全部免费。不要为升级转账。",
+  })
+})
+
+app.post("/api/upgrade", (c) =>
+  c.json(
+    {
+      error: "收费未开启",
+      pricing: "free",
+      reason: "全部功能免费。交易哈希不会被当成付款，也不会提升档位。",
+    },
+    410,
+  ),
+)
+
+async function requireApiKey(c, next) {
+  const apiKey = c.req.header("x-api-key")
+  if (!apiKey) return c.json({ error: "Missing x-api-key header" }, 401)
+  const repo = repoOf(c.env)
+  if (!repo) return c.json({ error: "数据库未配置" }, 503)
+  const month = monthOf(c.env)
+  const row = await repo.getKey(apiKey, month)
+  if (!row) return c.json({ error: "Invalid API key" }, 401)
+  const limit = Number.parseInt(c.env.TIER_FREE_LIMIT || "1000", 10)
+  if ((row.calls || 0) >= limit) {
+    return c.json({ error: "本月免费调用次数已用完，下月自动恢复", pricing: "free", limit, month }, 429)
+  }
+  await repo.bumpCalls(apiKey, month)
+  c.set("apiKey", apiKey)
   return next()
 }
 
-// ====== 工具函数 ======
-function getRpcUrl(env) {
-  return env.NETWORK === 'mainnet' ? env.ARC_MAINNET_RPC : env.ARC_TESTNET_RPC
-}
-
-async function getBlockNumber(rpc) {
-  const res = await fetch(rpc, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] })
+app.post("/api/payment/intent", requireApiKey, async (c) => {
+  const body = await readJson(c)
+  if (!body?.recipient || body.amount == null) return c.json({ error: "recipient 和 amount 必填" }, 400)
+  let micro
+  try {
+    micro = dollarsToMicro(body.amount)
+  } catch (error) {
+    return c.json({ error: error.message }, 400)
+  }
+  if (!isAddress(body.recipient) || micro <= 0n) return c.json({ error: "收款地址或金额无效" }, 400)
+  const repo = repoOf(c.env)
+  const id = await repo.insertIntent({
+    apiKey: c.get("apiKey"),
+    recipient: body.recipient,
+    amountDisplay: microToDollars(micro),
+    amountMicro: micro.toString(),
+    status: "pending",
+    decision: "REVIEW",
+    purpose: body.purpose || null,
+    day: today(c.env),
   })
-  const data = await res.json()
-  return parseInt(data.result, 16)
-}
-
-// ====== 路由 ======
-
-// 健康检查
-app.get('/api/health', async (c) => {
-  const rpc = getRpcUrl(c.env)
-  let blockNumber = 0
-  try { blockNumber = await getBlockNumber(rpc) } catch (e) {}
   return c.json({
-    ok: true,
-    network: c.env.NETWORK,
-    blockNumber,
-    owner: c.env.OWNER_WALLET,
-    tierFreeLimit: parseInt(c.env.TIER_FREE_LIMIT),
-    tierProMonthly: `$${c.env.TIER_PRO_MONTHLY}/month`
+    id,
+    recipient: body.recipient,
+    amount: microToDollars(micro),
+    status: "pending",
+    pricing: "free",
+    message: "意图已记录。ALLOW 需要调用 /api/preflight 并完成模拟。",
   })
 })
 
-// 提交支付意图
-app.post('/api/payment/intent', requireApiKey, async (c) => {
-  const body = await c.req.json()
-  const { recipient, amount, agentId } = body
-  if (!recipient || !amount) {
-    return c.json({ error: 'recipient and amount required' }, 400)
-  }
-  const apiKey = c.get('apiKey')
-  const result = await c.env.DB.prepare(
-    'INSERT INTO payment_intents (api_key, recipient, amount, status) VALUES (?, ?, ?, ?)'
-  ).bind(apiKey, recipient, amount, 'pending').run()
-  return c.json({
-    id: result.meta.last_row_id,
-    recipient,
-    amount,
-    status: 'pending',
-    message: 'Payment intent created. Awaiting policy check.'
+app.post("/api/policy/check", requireApiKey, async (c) => {
+  const body = await readJson(c)
+  if (!body?.recipient || body.amount == null) return c.json({ error: "recipient 和 amount 必填" }, 400)
+  const result = await runPreflight(c.env, {
+    recipient: body.recipient,
+    amount: String(body.amount),
+    from: body.from,
+    apiKey: c.get("apiKey"),
+    tx: body.tx,
   })
+  const repo = repoOf(c.env)
+  await repo.audit(c.get("apiKey"), "policy_check", result)
+  return c.json({ ...result, pricing: "free" })
 })
 
-// 策略检查
-app.post('/api/policy/check', requireApiKey, async (c) => {
-  const body = await c.req.json()
-  const { amount, recipient } = body
-  if (!amount || !recipient) {
-    return c.json({ error: 'amount and recipient required' }, 400)
+app.post("/api/preflight", requireApiKey, async (c) => {
+  const body = await readJson(c)
+  if (!body?.recipient || body.amount == null || !body.from) {
+    return c.json({ error: "recipient、amount、from 必填" }, 400)
   }
-  const amountNum = parseFloat(amount)
-  let decision = 'allow'
-  let reason = ''
-
-  // 规则1：单笔上限 $10,000
-  if (amountNum > 10000) {
-    decision = 'require_approval'
-    reason = 'Amount exceeds single transaction limit of $10,000'
-  }
-  // 规则2：每天上限
-  const apiKey = c.get('apiKey')
-  const today = new Date().toISOString().split('T')[0]
-  const dayTotal = await c.env.DB.prepare(
-    "SELECT COALESCE(SUM(CAST(amount AS REAL)), 0) as total FROM payment_intents WHERE api_key = ? AND date(created_at) = ?"
-  ).bind(apiKey, today).first()
-  if (dayTotal && parseFloat(dayTotal.total || '0') + amountNum > 50000) {
-    decision = 'deny'
-    reason = 'Daily limit of $50,000 exceeded'
-  }
-
-  // 记录审计
-  await c.env.DB.prepare(
-    'INSERT INTO audit_log (api_key, action, detail) VALUES (?, ?, ?)'
-  ).bind(apiKey, 'policy_check', JSON.stringify({ amount, recipient, decision, reason })).run()
-
-  return c.json({ decision, reason, amount, recipient })
+  const result = await runPreflight(c.env, {
+    recipient: body.recipient,
+    amount: String(body.amount),
+    from: body.from,
+    apiKey: c.get("apiKey"),
+    tx: body.tx,
+  })
+  await repoOf(c.env).audit(c.get("apiKey"), "preflight", { decision: result.decision, reasons: result.reasons })
+  return c.json({ ...result, pricing: "free" })
 })
 
-// 查询交易
-app.get('/api/transactions/:hash', requireApiKey, async (c) => {
-  const hash = c.req.param('hash')
-  const rpc = getRpcUrl(c.env)
-  const res = await fetch(rpc, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt',
-      params: [hash]
+app.post("/api/links", requireApiKey, async (c) => {
+  const body = await readJson(c)
+  if (!body?.recipient || body.amount == null) return c.json({ error: "recipient 和 amount 必填" }, 400)
+  let micro
+  try {
+    micro = dollarsToMicro(body.amount)
+  } catch (error) {
+    return c.json({ error: error.message }, 400)
+  }
+  if (!isAddress(body.recipient) || micro <= 0n) return c.json({ error: "收款地址或金额无效" }, 400)
+  const purpose = String(body.purpose || "").slice(0, 120)
+  const repo = repoOf(c.env)
+  const id = newId("", 12)
+  await repo.createLink({
+    id,
+    apiKey: c.get("apiKey"),
+    recipient: body.recipient.toLowerCase(),
+    amountMicro: micro.toString(),
+    amountDisplay: microToDollars(micro),
+    purpose,
+    day: today(c.env),
+  })
+  const row = await repo.getLink(id)
+  return c.json(viewLink(row, new URL(c.req.url).origin, c.env))
+})
+
+app.get("/api/links/:id", async (c) => {
+  const repo = repoOf(c.env)
+  if (!repo) return c.json({ error: "数据库未配置" }, 503)
+  const row = await repo.getLink(c.req.param("id"))
+  if (!row) return c.json({ error: "账单不存在" }, 404)
+  return c.json(viewLink(row, new URL(c.req.url).origin, c.env))
+})
+
+app.post("/api/links/:id/preflight", async (c) => {
+  const repo = repoOf(c.env)
+  if (!repo) return c.json({ error: "数据库未配置" }, 503)
+  const row = await repo.getLink(c.req.param("id"))
+  if (!row) return c.json({ error: "账单不存在" }, 404)
+  if (row.status !== "open") return c.json({ error: "账单已结算", status: row.status }, 409)
+  const body = await readJson(c)
+  if (!isAddress(body?.from || "")) return c.json({ error: "from 必须是付款钱包地址" }, 400)
+  const result = await runPreflight(c.env, {
+    recipient: row.recipient,
+    amount: row.amount_display,
+    from: body.from,
+    apiKey: row.api_key || row.apiKey,
+    exceptLinkId: row.id,
+  })
+  return c.json({ ...result, pricing: "free", linkId: row.id })
+})
+
+app.post("/api/links/:id/evidence", async (c) => {
+  const repo = repoOf(c.env)
+  if (!repo) return c.json({ error: "数据库未配置" }, 503)
+  const row = await repo.getLink(c.req.param("id"))
+  if (!row) return c.json({ error: "账单不存在" }, 404)
+  const body = await readJson(c)
+  const txHash = typeof body?.txHash === "string" ? body.txHash.toLowerCase() : ""
+  if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+    return c.json({ error: "txHash 无效" }, 400)
+  }
+  if (row.status === "settled" && row.tx_hash?.toLowerCase() === txHash.toLowerCase()) {
+    return c.json({ decision: "ALLOW", status: "settled", txHash, pricing: "free" })
+  }
+  const existing = await repo.findLinkByTx(txHash)
+  if (existing && existing.id !== row.id) return c.json({ error: "这笔交易已经用于另一张账单" }, 409)
+
+  let receipt
+  let tx
+  try {
+    receipt = await rpc(resolveRpc(c.env), "eth_getTransactionReceipt", [txHash])
+    tx = await rpc(resolveRpc(c.env), "eth_getTransactionByHash", [txHash])
+  } catch (error) {
+    return c.json({ decision: "BLOCK", reasons: [error.message] }, 502)
+  }
+  if (!receipt || !tx) return c.json({ decision: "BLOCK", reasons: ["交易尚未上链"] }, 404)
+  const decoded = decodePayment({ to: tx.to, data: tx.input || tx.data || "0x", value: tx.value || "0x0" })
+  if (!decoded.ok || decoded.recipient !== row.recipient.toLowerCase() || decoded.micro !== BigInt(row.amount_micro)) {
+    return c.json({ decision: "BLOCK", reasons: ["交易内容与账单不一致"] })
+  }
+  const evidence = evaluateEvidence({
+    receipt,
+    expected: { recipient: row.recipient, amountMicro: row.amount_micro, payer: tx.from },
+  })
+  if (evidence.decision !== "ALLOW") return c.json(evidence)
+  await repo.settleLink({ id: row.id, txHash, payer: tx.from, evidence })
+  await repo.audit(row.api_key || row.apiKey, "evidence", { id: row.id, txHash, decision: "ALLOW" })
+  return c.json({ ...evidence, status: "settled", txHash, pricing: "free" })
+})
+
+app.get("/api/transactions/:hash", requireApiKey, async (c) => {
+  const hash = c.req.param("hash")
+  try {
+    const receipt = await rpc(resolveRpc(c.env), "eth_getTransactionReceipt", [hash])
+    if (!receipt) return c.json({ status: "not_found" }, 404)
+    return c.json({
+      status: receipt.status === "0x1" ? "success" : "failed",
+      blockNumber: Number.parseInt(receipt.blockNumber, 16),
+      from: receipt.from,
+      to: receipt.to,
     })
-  })
-  const data = await res.json()
-  if (!data.result) return c.json({ status: 'not_found' }, 404)
-  return c.json({
-    status: data.result.status === '0x1' ? 'success' : 'failed',
-    blockNumber: parseInt(data.result.blockNumber, 16),
-    from: data.result.from,
-    to: data.result.to
-  })
+  } catch (error) {
+    return c.json({ error: error.message }, 502)
+  }
 })
 
-// 对账
-app.post('/api/reconciliation', requireApiKey, async (c) => {
-  const apiKey = c.get('apiKey')
-  // 标记所有pending的为checked
-  await c.env.DB.prepare(
-    "UPDATE payment_intents SET status = 'checked', checked_at = datetime('now') WHERE api_key = ? AND status = 'pending'"
-  ).bind(apiKey).run()
-  const result = await c.env.DB.prepare(
-    'SELECT COUNT(*) as total, status FROM payment_intents WHERE api_key = ? GROUP BY status'
-  ).bind(apiKey).all()
-  return c.json({
-    checked: true,
-    summary: result.results || []
-  })
+app.post("/api/reconciliation", requireApiKey, (c) =>
+  c.json(
+    {
+      error: "不再把本地状态改成已对账。请把交易哈希提交到 /api/links/:id/evidence",
+      pricing: "free",
+    },
+    410,
+  ),
+)
+
+app.get("/api/audit", requireApiKey, async (c) => {
+  const logs = await repoOf(c.env).listAudit(c.get("apiKey"))
+  return c.json({ logs, pricing: "free" })
 })
 
-// 注册API Key（付费入口）
-app.post('/api/register', async (c) => {
-  const body = await c.req.json()
-  const { owner, tier } = body
-  if (!owner) return c.json({ error: 'owner required (wallet address)' }, 400)
+export { app }
 
-  // Generate random API key using crypto
-  const arr = new Uint8Array(18)
-  crypto.getRandomValues(arr)
-  const apiKey = `arc_${Array.from(arr, b => b.toString(16).padStart(2, '0')).join('')}`
-
-  await c.env.DB.prepare(
-    'INSERT INTO api_keys (key, tier, owner) VALUES (?, ?, ?)'
-  ).bind(apiKey, tier || 'free', owner).run()
-
-  await c.env.DB.prepare(
-    'INSERT INTO audit_log (api_key, action, detail) VALUES (?, ?, ?)'
-  ).bind(apiKey, 'register', JSON.stringify({ owner, tier: tier || 'free' })).run()
-
-  return c.json({
-    apiKey,
-    tier: tier || 'free',
-    owner,
-    upgradeInfo: {
-      proPrice: `$${c.env.TIER_PRO_MONTHLY}/month`,
-      paymentWallet: c.env.OWNER_WALLET
-    }
-  })
-})
-
-// 升级到Pro
-app.post('/api/upgrade', async (c) => {
-  const body = await c.req.json()
-  const { apiKey, txHash } = body
-  if (!apiKey || !txHash) return c.json({ error: 'apiKey and txHash required' }, 400)
-
-  // 验证交易（简化版）
-  const rpc = getRpcUrl(c.env)
-  const res = await fetch(rpc, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0', id: 1, method: 'eth_getTransactionByHash',
-      params: [txHash]
-    })
-  })
-  const data = await res.json()
-  if (!data.result) return c.json({ error: 'Transaction not found' }, 404)
-
-  await c.env.DB.prepare(
-    "UPDATE api_keys SET tier = 'pro', calls = 0 WHERE key = ?"
-  ).bind(apiKey).run()
-
-  await c.env.DB.prepare(
-    'INSERT INTO audit_log (api_key, action, detail) VALUES (?, ?, ?)'
-  ).bind(apiKey, 'upgrade', JSON.stringify({ txHash, tier: 'pro' })).run()
-
-  return c.json({ apiKey, tier: 'pro', message: 'Upgraded to Pro' })
-})
-
-// 审计日志
-app.get('/api/audit', requireApiKey, async (c) => {
-  const apiKey = c.get('apiKey')
-  const logs = await c.env.DB.prepare(
-    'SELECT * FROM audit_log WHERE api_key = ? ORDER BY created_at DESC LIMIT 50'
-  ).bind(apiKey).all()
-  return c.json({ logs: logs.results })
-})
-
-// ====== 启动 ======
 export default {
   async fetch(request, env, ctx) {
-    try { await initDB(env) } catch (e) {}
-    return app.fetch(request, env, ctx)
-  }
+    try {
+      const repo = env.REPO || (env.DB ? createSqlRepo(env.DB) : null)
+      if (repo) {
+        env.REPO = repo
+        await repo.init()
+      }
+      return app.fetch(request, env, ctx)
+    } catch {
+      return Response.json({ ok: false, pricing: "free", error: "startup_failed" }, { status: 500 })
+    }
+  },
 }
