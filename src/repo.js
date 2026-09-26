@@ -2,61 +2,26 @@ export function createSqlRepo(db) {
   return {
     async init() {
       if (!db) return
-      await db.exec(`
-        CREATE TABLE IF NOT EXISTS api_keys (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          key TEXT UNIQUE NOT NULL,
-          tier TEXT DEFAULT 'free',
-          owner TEXT NOT NULL,
-          created_at TEXT DEFAULT (datetime('now')),
-          calls INTEGER DEFAULT 0,
-          last_call TEXT
-        );
-        CREATE TABLE IF NOT EXISTS payment_intents (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          api_key TEXT NOT NULL,
-          recipient TEXT NOT NULL,
-          amount TEXT NOT NULL,
-          status TEXT DEFAULT 'pending',
-          tx_hash TEXT,
-          created_at TEXT DEFAULT (datetime('now')),
-          checked_at TEXT,
-          reconciled_at TEXT,
-          policy_decision TEXT
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          api_key TEXT NOT NULL,
-          action TEXT NOT NULL,
-          detail TEXT,
-          created_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS payment_links (
-          id TEXT PRIMARY KEY,
-          api_key TEXT NOT NULL,
-          recipient TEXT NOT NULL,
-          amount_micro TEXT NOT NULL,
-          amount_display TEXT NOT NULL,
-          purpose TEXT,
-          status TEXT DEFAULT 'open',
-          tx_hash TEXT,
-          payer TEXT,
-          evidence TEXT,
-          created_at TEXT DEFAULT (datetime('now')),
-          settled_at TEXT
-        );
-      `)
-      for (const sql of [
+      const statements = [
+        "CREATE TABLE IF NOT EXISTS api_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL, tier TEXT DEFAULT 'free', owner TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), calls INTEGER DEFAULT 0, calls_month TEXT, last_call TEXT)",
+        "CREATE TABLE IF NOT EXISTS payment_intents (id INTEGER PRIMARY KEY AUTOINCREMENT, api_key TEXT NOT NULL, recipient TEXT NOT NULL, amount TEXT NOT NULL, amount_micro TEXT, purpose TEXT, created_day TEXT, status TEXT DEFAULT 'pending', tx_hash TEXT, created_at TEXT DEFAULT (datetime('now')), checked_at TEXT, reconciled_at TEXT, policy_decision TEXT)",
+        "CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, api_key TEXT NOT NULL, action TEXT NOT NULL, detail TEXT, created_at TEXT DEFAULT (datetime('now')))",
+        "CREATE TABLE IF NOT EXISTS payment_links (id TEXT PRIMARY KEY, api_key TEXT NOT NULL, recipient TEXT NOT NULL, amount_micro TEXT NOT NULL, amount_display TEXT NOT NULL, purpose TEXT, status TEXT DEFAULT 'open', tx_hash TEXT, payer TEXT, evidence TEXT, created_day TEXT, created_at TEXT DEFAULT (datetime('now')), settled_at TEXT)",
         "ALTER TABLE payment_intents ADD COLUMN amount_micro TEXT",
         "ALTER TABLE payment_intents ADD COLUMN purpose TEXT",
         "ALTER TABLE payment_intents ADD COLUMN created_day TEXT",
         "ALTER TABLE api_keys ADD COLUMN calls_month TEXT",
         "ALTER TABLE payment_links ADD COLUMN created_day TEXT",
-      ]) {
+      ]
+      for (const sql of statements) {
         try {
           await db.exec(sql)
-        } catch {
-          /* column already exists */
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error)
+          if (!/duplicate column|already exists/i.test(message)) {
+            if (sql.startsWith("ALTER")) continue
+            throw error
+          }
         }
       }
     },

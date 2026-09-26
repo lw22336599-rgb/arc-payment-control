@@ -449,7 +449,8 @@ export default {
         await repo.init()
       }
       return app.fetch(request, env, ctx)
-    } catch {
+    } catch (error) {
+      console.error(error)
       return Response.json({ ok: false, pricing: "free", error: "startup_failed" }, { status: 500 })
     }
   },
