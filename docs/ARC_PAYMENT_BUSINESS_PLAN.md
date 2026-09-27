@@ -8,7 +8,7 @@
 
 - 远程仓库是 `lw22336599-rgb/arc-payment-control`，不是官网 [LedgerGuard](https://ledgerguard-gules.vercel.app/) 所链的 `lw22336599-rgb/ledgerguard`。同一作者，两个产品。
 - 本仓库是 Cloudflare Workers 上的支付意图、限额、审计接口。没有钱包、没有支付链接、没有链上 USDC 解码、没有自动化测试。
-- 2026-09-26 请求 `https://arc-payment-control.useful-ermine.workers.dev/api/health` 返回 500。
+- 2026-09-26 请求 `https://arc-payment-control.useful-ermine.workers.dev/api/health` 返回 500。2026-09-27 已改部署到当前账号：`https://arc-payment-control.lw22336599.workers.dev/api/health` 返回测试网链 ID 5042002。
 - `wrangler.toml` 使用 `https://testnet.arc.network` 与 `https://mainnet.arc.network`。官方端点是 `https://rpc.testnet.arc.io` 与 `https://rpc.mainnet.arc.io`（[Connect to Arc](https://docs.arc.network/arc/references/connect-to-arc)）。
 - 对账接口把本地 `pending` 改成 `checked`，并不核对链上回执。升级接口不核对 USDC 收款地址与金额。注册接口可由调用方自行指定 Pro。
 

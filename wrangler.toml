@@ -6,7 +6,7 @@ compatibility_date = "2026-07-28"
 [[d1_databases]]
 binding = "DB"
 database_name = "arc-payment-db"
-database_id = "e2b7415f-7b65-4f00-a7e4-18f86accf852"
+database_id = "e632cb95-fb7a-4327-ab3b-ae9d400df014"
 
 # Environment variables
 [vars]

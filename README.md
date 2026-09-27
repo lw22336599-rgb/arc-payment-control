@@ -12,7 +12,9 @@ npm test
 npm run dev
 ```
 
-打开本地页面，连接钱包，填写金额，生成链接发给对方。对方需要 Arc 测试网 USDC，可从 [Circle 水龙头](https://faucet.circle.com) 领取。测试币没有真实价值。
+线上页面：https://arc-payment-control.lw22336599.workers.dev
+
+打开页面，连接钱包，填写金额，生成链接发给对方。对方需要 Arc 测试网 USDC，可从 [Circle 水龙头](https://faucet.circle.com) 领取。测试币没有真实价值。`/api/health` 返回的链 ID 是测试网 `5042002`。
 
 ## 给其他应用接入
 
